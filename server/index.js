@@ -251,6 +251,44 @@ function buildRace(c) {
 // 读取/解析比赛记录
 const parseRace = r => (r ? { ...r, settled: !!r.settled, record: JSON.parse(r.record) } : null)
 function getRaceRow(id) { return get('SELECT * FROM races WHERE id=?', Number(id)) }
+
+/* ================= 结算 / 回滚 / 归还共用的「租约磨损台账」记账 =================
+ * 唯一计费口径：磨损费 = wear_total × wear_rate，退款 = max(0, deposit − 磨损费)。
+ * 结算记账、越站修复冲回、归还结算三处都经由这两个助手，保证任何时刻
+ * rentals.wear_total / wear_fee / refund 与各场 races 记录严格对账、互相可逆。
+ */
+// 取比赛记录快照所指向的租约（不看 status：active/returned 都要按同口径记账）
+function rentalOfRace(rec) {
+  const rtId = rec?.factors?.rental?.id
+  return rtId ? get('SELECT * FROM rentals WHERE id=?', rtId) || null : null
+}
+// 按当前累计磨损重算归还结算金额；仅已归还租约落账（active 租约在归还接口才算退款）
+function recomputeRentalSettlement(rt) {
+  const wearFee = rt.wear_total * rt.wear_rate
+  const refund = Math.max(0, rt.deposit - wearFee)
+  if (rt.status === 'returned') {
+    run('UPDATE rentals SET wear_fee=?, refund=? WHERE id=?', wearFee, refund, rt.id)
+  }
+  return { wearFee, refund }
+}
+// 把一场比赛的磨损计入租约（dir=+1 结算扣减 / -1 越站修复冲回），返回车队资金应联动的金额：
+//   · active 租约：只记台账（parts_dur/wear_total/races_used），退款留待归还时结算，资金为 0；
+//   · returned 租约：磨损费已钱货两讫，台账变动后重算并落账 wear_fee/refund，
+//     同步多退少补——结算补记时向车队补收磨损费（money-），修复冲回时退还差额（money+）。
+// 资金联动额统一由调用方汇总入账，保证「比赛结算 ↔ 租约归还 ↔ 越站修复」三处边界一致。
+function postRentalWear(rt, { wear, wearApplied }, dir) {
+  // dir=+1 结算：健康扣减、累计磨损与场次增加；dir=-1 修复：全部反向冲回
+  const partsNext = Math.round(clamp(rt.parts_dur - dir * wearApplied, 10, 100))
+  const wearNext = Math.max(0, rt.wear_total + dir * wear)
+  const usedNext = Math.max(0, rt.races_used + dir)
+  run('UPDATE rentals SET parts_dur=?, wear_total=?, races_used=? WHERE id=?',
+    partsNext, wearNext, usedNext, rt.id)
+  if (rt.status !== 'returned') return 0
+  const beforeRefund = rt.refund ?? Math.max(0, rt.deposit - rt.wear_total * rt.wear_rate)
+  const after = recomputeRentalSettlement({ ...rt, status: 'returned', wear_total: wearNext })
+  return after.refund - beforeRefund   // 正：应退给车队；负：应向车队补收
+}
+
 // 单场已结算比赛的发奖口径（与 settleRace 完全一致）；历史修复按此逐项反向回滚
 function raceEffect(row, c) {
   let rec = null
@@ -259,24 +297,28 @@ function raceEffect(row, c) {
   const pts = row.pts ?? rec?.result?.pts ?? (PTS[rank - 1] || 1)
   const money = row.money ?? rec?.result?.money ?? 0
   const wear = row.wear ?? rec?.result?.wear ?? 0
+  // 实际扣减量优先取结算落库值（受健康地板截断），旧记录无此列时按名义磨损兜底
+  const wearApplied = row.wear_applied ?? wear
+  const hpApplied = row.hp_applied ?? wear
   const repGain = row.rep_gain ?? rec?.result?.repGain ?? Math.max(1, 5 - rank + (c?.diff || 0))
-  return { row, rec, rank, pts, money, wear, repGain }
+  return { row, rec, rank, pts, money, wear, wearApplied, hpApplied, repGain, rentalDelta: 0 }
 }
-// 反向回滚单场已结算比赛：部件磨损（parts_dur/hp）与机师经验、心情同积分奖金一道冲回，
-// 保证「资源状态」与「战绩」始终一致。维护等操作若已介入，恢复值以 100 为上限，不会溢出。
+// 反向回滚单场已结算比赛：积分/奖金/声望之外，部件磨损（parts_dur/hp）与机师经验、心情、
+// 租约磨损台账/已结算退款一并冲回，保证「资源状态」「战绩」「租约退款」始终一致。
+// 返回 rentalDelta（正数=应退给车队的退款差额），由迁移事务汇总入账。
 function reverseSettledRace(row, c) {
   const g = raceEffect(row, c)
-  const rtId = g.rec?.factors?.rental?.id
-  const rt = rtId ? get("SELECT * FROM rentals WHERE id=? AND status='active'", rtId) : null
+  const rt = rentalOfRace(g.rec)
   if (rt) {
-    // 该场为租约艇出赛且租约仍在履行：磨损与已用场次一并回滚到租约（恢复以 100 为上限）
-    run('UPDATE rentals SET parts_dur=MIN(100,parts_dur+?), wear_total=MAX(0,wear_total-?), races_used=MAX(0,races_used-1) WHERE id=?',
-      g.wear, g.wear, rt.id)
-  } else if (!rtId) {
+    // 本场为租约艇出赛：active 租约回滚台账（归还时自然少计费）；
+    // returned 租约重算磨损费/退款并把差额退还车队，幂等重放结果相同。
+    g.rentalDelta = postRentalWear(rt, g, -1)
+  } else {
+    // 自有艇出赛：按结算时的实际扣减量精确恢复（维护等操作介入时以 100 为上限，不溢出）
     const a = airship()
-    run('UPDATE airships SET parts_dur=MIN(100,parts_dur+?), hp=MIN(100,hp+?) WHERE id=?', g.wear, g.wear, a.id)
+    run('UPDATE airships SET parts_dur=MIN(100,parts_dur+?), hp=MIN(100,hp+?) WHERE id=?',
+      g.wearApplied, g.hpApplied, a.id)
   }
-  // 租约已归还：磨损费已钱货两讫，不再回滚任何部件（自有艇本场也未磨损）
   const pilotId = g.rec?.factors?.pilot?.id
   if (pilotId) {
     const expGain = g.rank <= 4 ? 3 : 1   // 与 settleRace 的发奖口径逐字对应
@@ -295,9 +337,10 @@ function settleRace(id) {
   const rec = JSON.parse(row.record)
   const c = get('SELECT * FROM circuits WHERE id=?', row.circuit_id)
   let result
-  db.exec('BEGIN')
+  db.exec('BEGIN IMMEDIATE')
   try {
-    // 事务内二次确认闸门：同步执行下杜绝并发/重放造成的重复发奖
+    // 事务内二次确认闸门：BEGIN IMMEDIATE 立即取写锁，并发/重放请求串行化后在此二次校验，
+    // 与租约签约/归还、商店扣款共用同一强事务边界，杜绝重复发奖与台账竞争
     const again = getRaceRow(id)
     if (again.status === 'void') {
       result = { ok: false, status: 409, msg: '该比赛已在历史修复中作废，不能再次结算' }
@@ -314,16 +357,22 @@ function settleRace(id) {
         result = { ok: false, status: 409, msg: '前置赛站尚未完赛，该比赛暂不能结算' }
       } else {
         const { rank, pts, money, wear, repGain } = rec.result
-        const rtId = rec.factors.rental?.id
-        const rt = rtId ? get("SELECT * FROM rentals WHERE id=? AND status='active'", rtId) : null
+        const rt = rentalOfRace(rec)
+        // 实际扣减受健康地板截断：按截断值冲减健康、按名义磨损累计租约计费磨损，
+        // 截断值随 races 落库，回滚时逐项精确冲回（结算/回滚严格对称）
+        let wApplied = wear, hApplied = wear
         if (rt) {
-          // 租约艇出赛：磨损记入租约（归还时按 wear_total 计费）并计一场次，自有艇不磨损
-          run('UPDATE rentals SET parts_dur=MAX(10,parts_dur-?), wear_total=wear_total+?, races_used=races_used+1 WHERE id=?',
-            wear, wear, rt.id)
+          // 租约艇出赛：磨损记入租约台账（active 待归还计费 / returned 当场多退少补），自有艇封存不磨损
+          wApplied = Math.min(wear, Math.max(0, rt.parts_dur - 10))
+          const delta = postRentalWear(rt, { wear, wearApplied: wApplied }, +1)
+          if (delta < 0) run('UPDATE team SET money=money+? WHERE id=1', delta) // 已归还租约：补收磨损费
+          hApplied = null
         } else {
           const a = airship()
-          const newPd = Math.max(10, a.parts_dur - wear)
-          run('UPDATE airships SET parts_dur=?, hp=? WHERE id=?', newPd, Math.max(20, a.hp - wear), a.id)
+          wApplied = Math.min(wear, Math.max(0, a.parts_dur - 10))
+          hApplied = Math.min(wear, Math.max(0, a.hp - 20))
+          run('UPDATE airships SET parts_dur=?, hp=? WHERE id=?',
+            a.parts_dur - wApplied, a.hp - hApplied, a.id)
         }
         if (rec.factors.pilot) {
           run('UPDATE pilots SET exp=exp+?, mood=MIN(100,MAX(0,mood-?)) WHERE id=?',
@@ -337,8 +386,9 @@ function settleRace(id) {
         const note = rec.factors.weather === '晴' ? `晴空万里，${rec.circuit.name}` : `${rec.factors.weather}天，${rec.circuit.name}`
         run('INSERT INTO race_log (circuit_id, race_id, season, rank, pts, money, note, ts) VALUES (?,?,?,?,?,?,?,?)',
           row.circuit_id, row.id, rec.season, rank, pts, money, note, now())
-        run("UPDATE races SET status='settled', settled=1, rank=?, pts=?, money=?, wear=?, rep_gain=?, settled_at=? WHERE id=?",
-          rank, pts, money, wear, repGain, now(), row.id)
+        // 实际扣减随记录一并落库：越站修复按此精确冲回，结算/回滚严格对称
+        run("UPDATE races SET status='settled', settled=1, rank=?, pts=?, money=?, wear=?, wear_applied=?, hp_applied=?, rep_gain=?, settled_at=? WHERE id=?",
+          rank, pts, money, wear, wApplied, hApplied, repGain, now(), row.id)
         reconcileSponsors() // 同一事务内对账赞助商
         result = { ok: true, already: false, race: parseRace(getRaceRow(id)) }
       }
@@ -370,10 +420,13 @@ function reconcileSponsors() {
 // 历史数据兼容（迁移补偿）：修复「跳站参赛」产生的脏数据——首个未完成赛站之后的
 // 完赛记录一律视为越站。在同一事务内：
 //   1) 按各场记录的发奖口径，回滚积分/奖金/声望/部件磨损（parts_dur、hp）/机师经验与心情；
+//      租约艇出赛的场次同步回滚租约台账——active 租约回滚累计磨损与场次（归还时自然少计费），
+//      returned 租约重算磨损费/退款并把多收的磨损费差额退还车队；
 //   2) 删除对应 race_log 流水（含无记录关联的老版残留流水）；
 //   3) 将这些赛站的 races 记录一律置为 void（作废，不再出现在历史战绩、不能续看或再结算）；
 //   4) 重置赛站，再统一重算赞助商对账与赛季名次。
-// 函数天然幂等：已作废的记录与已删流水在重启时不会被再次统计。
+// 函数天然幂等：已作废的记录与已删流水在重启时不会被再次统计；租约台账以 wear_total 为准
+// 重算退款，重复执行结果相同，不会二次退款。
 function reconcileLegacySkips() {
   const cs = orderedCircuits()
   const firstOpen = cs.findIndex(c => !c.finished)
@@ -381,9 +434,11 @@ function reconcileLegacySkips() {
   const skipped = cs.slice(firstOpen + 1).filter(c => c.finished)
   if (!skipped.length) return
 
-  db.exec('BEGIN')
+  db.exec('BEGIN IMMEDIATE')
   try {
     let ptsBack = 0, moneyBack = 0, repBack = 0, wearBack = 0, racesVoided = 0, expBack = 0, moodBack = 0
+    // refundBack：已归还租约因磨损台账回滚而应退还给车队的押金差额（与奖金回滚方向相反，分开汇总）
+    let refundBack = 0
     skipped.forEach(c => {
       // 已被 races 记录认领的流水 id：其数额随记录回滚，兜底循环里不得再统计，避免双重回滚
       const claimedLogIds = new Set()
@@ -391,7 +446,8 @@ function reconcileLegacySkips() {
       all('SELECT * FROM races WHERE circuit_id=? ORDER BY id ASC', c.id).forEach(rw => {
         if (rw.settled || rw.status === 'settled') {
           const g = reverseSettledRace(rw, c)
-          ptsBack += g.pts; moneyBack += g.money; repBack += g.repGain; wearBack += g.wear
+          ptsBack += g.pts; moneyBack += g.money; repBack += g.repGain; wearBack += g.wearApplied
+          refundBack += g.rentalDelta > 0 ? g.rentalDelta : 0
           if (g.rec?.factors?.pilot?.id) {
             expBack += g.rank <= 4 ? 3 : 1
             moodBack += g.rank > 8 ? 6 : 2
@@ -413,16 +469,17 @@ function reconcileLegacySkips() {
       console.log(`[SKY] 历史修复：赛站《${c.name}》在前置赛站未完成时已完赛（名次 ${c.rank}），回滚战绩、奖励、部件磨损与人员经验`)
       run('UPDATE circuits SET finished=0, rank=NULL WHERE id=?', c.id)
     })
-    if (ptsBack || moneyBack || repBack) {
-      run('UPDATE team SET season_pts=MAX(0,season_pts-?), money=money-?, rep=rep-? WHERE id=1', ptsBack, moneyBack, repBack)
-    }
+    // 奖金/积分/声望按发奖口径冲回；已归还租约多收的磨损费按重算后的退款差额补退，两条资金线分开入账
+    run('UPDATE team SET season_pts=MAX(0,season_pts-?), money=money-?+?, rep=MAX(0,rep-?) WHERE id=1',
+      ptsBack, moneyBack, refundBack, repBack)
 
     reconcileSponsors()
     const ranks = orderedCircuits().filter(x => x.finished && x.rank).map(x => x.rank)
     run('UPDATE team SET season_pos=? WHERE id=1', ranks.length ? Math.max(1, Math.min(...ranks)) : 1)
     db.exec('COMMIT')
     console.log(`[SKY] 历史修复完成：作废 ${racesVoided} 条越站比赛记录（${skipped.length} 个赛站），` +
-      `积分 -${ptsBack}，奖金 -${moneyBack}，声望 -${repBack}，部件磨损恢复 +${wearBack}，机师经验 -${expBack}、心情 +${moodBack}`)
+      `积分 -${ptsBack}，奖金 -${moneyBack}，声望 -${repBack}，部件磨损恢复 +${wearBack}，` +
+      `机师经验 -${expBack}、心情 +${moodBack}，租约押金补退 +${refundBack}`)
   } catch (e) {
     db.exec('ROLLBACK')
     console.error('[SKY] 历史修复失败，已回滚本次迁移补偿', e)

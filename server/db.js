@@ -106,17 +106,20 @@ CREATE TABLE IF NOT EXISTS rentals (
   returned_at TEXT
 );
 -- 比赛记录：动画 / 实时排名 / 最终奖励共用的唯一事实来源
--- status=running 未完赛（可中断续看）；settled=1 已结算（奖励只发一次，可历史回放）
+-- status=running 未完赛（可中断续看）；settled=1 已结算（奖励只发一次，可历史回放）；
+-- status=void 越站历史修复作废（不再参与历史/结算）
 CREATE TABLE IF NOT EXISTS races (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   circuit_id INTEGER NOT NULL,
   season INTEGER NOT NULL DEFAULT 1,
-  status TEXT NOT NULL DEFAULT 'running',  -- running | settled
+  status TEXT NOT NULL DEFAULT 'running',  -- running | settled | void
   settled INTEGER NOT NULL DEFAULT 0,
   rank INTEGER,
   pts INTEGER DEFAULT 0,
   money REAL DEFAULT 0,
   wear INTEGER DEFAULT 0,
+  wear_applied INTEGER,                    -- 结算时部件健康实际扣减（受健康地板截断）；回滚按此精确冲回
+  hp_applied INTEGER,                      -- 自有艇 hp 的实际扣减（同 wear_applied，仅自有艇出赛有值）
   rep_gain INTEGER DEFAULT 0,
   record TEXT NOT NULL,                    -- 分段过程、快照因素、事件与奖励（JSON）
   watch_el REAL NOT NULL DEFAULT 0,        -- 最近观赛进度（秒），中断续看
@@ -130,6 +133,9 @@ CREATE TABLE IF NOT EXISTS races (
 try { db.exec('ALTER TABLE race_log ADD COLUMN race_id INTEGER') } catch (e) {}
 // 老库兼容：races 增加 voided_at 列（越站历史修复作废记录用）
 try { db.exec('ALTER TABLE races ADD COLUMN voided_at TEXT') } catch (e) {}
+// 老库兼容：races 增补「实际扣减」列，供越站修复按结算口径精确回滚磨损（旧记录按名义磨损兜底）
+try { db.exec('ALTER TABLE races ADD COLUMN wear_applied INTEGER') } catch (e) {}
+try { db.exec('ALTER TABLE races ADD COLUMN hp_applied INTEGER') } catch (e) {}
 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }
